@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__strapi-docs__search_strapi_knowledge_sources",
+      "Bash(pnpm install @strapi/plugin-graphql@5.0.0)",
+      "Bash(pnpm run build)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "strapi-docs"
+  ]
+}
