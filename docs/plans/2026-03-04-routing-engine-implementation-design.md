@@ -19,6 +19,7 @@
 | Error handling | `ApplicationError` from `@strapi/utils` | Official pattern for lifecycle errors, surfaces correctly in admin panel |
 | Self-referential relation | `manyToOne` (parent) + `oneToMany` (children) on Page | Documented Strapi v5 pattern for page hierarchies |
 | Lifecycle state passing | `event.state` object between before/after hooks | Official Strapi v5 mechanism |
+| Draft & Publish guard | Hooks detect and skip internal D&P operations (publish, unpublish, discardDraft) | These operations trigger create/delete hooks internally — our routing logic must only run on real user edits, not on Strapi's internal version management |
 | Front-end scope | Out of scope for this repo | Nuxt app in separate repo, consumes Strapi via GraphQL |
 | API de résolution custom | Évolution future | Le front Nuxt fera 2 requêtes GraphQL simples (page par fullpath + redirect lookup). Pas besoin d'endpoint custom côté Strapi pour l'instant. |
 | Breadcrumb | Champ JSON `breadcrumb` stocké sur Page, read-only, calculé par les hooks | Même cycle de vie que fullpath. Tableau d'items `{ title, fullpath, isClickable }`. Le front reçoit le breadcrumb complet sans requête supplémentaire. |
@@ -80,7 +81,8 @@ src/
 │       │   │   └── index.ts                     # Barrel export
 │       │   └── utils/
 │       │       ├── constants.ts                 # HOMEPAGE_SLUG, RESERVED_SLUGS, SLUG_REGEX, UIDs
-│       │       └── types.ts                     # Shared types (PageData, BreadcrumbItem, LifecycleEvent, etc.)
+│       │       ├── types.ts                     # Shared types (PageData, BreadcrumbItem, LifecycleEvent, etc.)
+│       │       └── draft-and-publish.ts         # Guards: isRoutingRelevantSave(), isRealDeletion()
 │       └── index.ts                             # Optional: re-exports for clean imports
 ```
 
@@ -162,7 +164,7 @@ src/
 - `fullpath` has `unique: true` — Strapi creates the DB index automatically
 - `fullpath` is **not** `required` — it's computed by the lifecycle hook on create, so it doesn't exist yet when the form is submitted
 - `breadcrumb` is a JSON field storing an array: `[{ title: string, fullpath: string, isClickable: boolean }]`. Computed alongside fullpath, same lifecycle. `isClickable` is `true` for `type: "page"`, `false` for `type: "section"`.
-- `draftAndPublish: true` — compatible with future draft/preview feature
+- `draftAndPublish: true` — compatible with future draft/preview feature. **Important caveat**: when D&P is enabled, Strapi skips `unique` validation on draft saves at DB level. Our custom uniqueness check in the before-save hook (step 4) is the real safeguard — it runs on every save regardless of draft/published status.
 - Self-referential relation uses `manyToOne`/`oneToMany` — documented Strapi v5 pattern
 
 ### 3.2 Redirect (`api::redirect.redirect`)
@@ -327,6 +329,13 @@ export default {
 
 ```
 handleBeforeCreateOrUpdate(event):
+  0. GUARD — Skip if no routing-relevant data in event.params.data
+     If slug is absent/undefined AND parent is absent/undefined → return early.
+     This filters out internal D&P operations (publish, unpublish, discardDraft)
+     which trigger beforeCreate/beforeUpdate but only carry internal fields,
+     not user-editable content like slug or parent.
+     On these internal calls, fullpath is already set from a previous real save,
+     so we just let Strapi copy the existing data without interference.
   1. validateSlug(event.params.data.slug)
   2. if update: detectCycle(currentPageId, newParentId)
   3. computeFullpath(slug, parentId) → newFullpath
@@ -342,6 +351,8 @@ handleBeforeCreateOrUpdate(event):
 
 ```
 handleAfterCreateOrUpdate(event):
+  0. GUARD — Skip if event.state has no routing data (oldFullpath not set, no title/type change tracked).
+     This means the before-hook returned early (D&P internal operation) → nothing to do here either.
   1. Determine if cascade is needed:
      - fullpath changed (event.state.oldFullpath !== result.fullpath) → cascade fullpaths + redirects + breadcrumbs
      - OR title/type changed without fullpath change → cascade breadcrumbs only (descendants reference parent title/type)
@@ -358,6 +369,20 @@ handleAfterCreateOrUpdate(event):
 
 ```
 handleBeforeDelete(event):
+  0. GUARD — Distinguish real deletion from internal D&P version management.
+     When Strapi's Document Service calls publish(), unpublish(), or discardDraft(),
+     it internally triggers beforeDelete to remove old draft/published versions.
+     These internal deletions must NOT be blocked by our children/homepage checks.
+
+     Detection strategy: use event.params.where to load the row being deleted.
+     If the row's publishedAt indicates it's a published version being replaced
+     (i.e., another version with the same documentId still exists), skip our checks.
+     Alternatively, check if the deletion targets a specific DB `id` (internal version
+     cleanup) vs. a `documentId` (real user-initiated deletion).
+
+     Implementation note: the safest approach is to query whether the document
+     will still have at least one remaining version (draft or published) after
+     this delete. If yes → internal D&P operation → skip. If no → real deletion → check.
   1. Load the page being deleted (with its fullpath and slug)
   2. checkHomepageDeletion(page)
   3. checkForChildren(page.documentId)
@@ -522,8 +547,28 @@ cascadeBreadcrumbs(changedPage: PageData): Promise<void>
 
 - **Document Service API** is the primary API. Entity Service is deprecated.
 - **Lifecycle hooks** use `event.params.data`, `event.result`, and `event.state`.
-- **`strapi.db.query()`** (Query Engine) is used only for cascade bulk updates to avoid hook re-entrance. This is documented as acceptable when you need to bypass lifecycle hooks intentionally.
+- **`strapi.db.query()`** (Query Engine) is used only for cascade bulk updates to avoid hook re-entrance. This is documented as acceptable when you need to bypass lifecycle hooks intentionally. Query Engine operates with `id` (DB row), not `documentId` — this is expected and means cascade updates touch both draft and published rows, which is correct (fullpath must be consistent across versions).
 - **`updateMany`/`deleteMany` bulk lifecycles** are never triggered by Document Service methods — confirmed in migration docs.
 - **Self-referential relations** are fully supported via `manyToOne` + `oneToMany` with `inversedBy`/`mappedBy` on the same content type.
-- **`unique: true`** on schema attributes creates DB-level unique indexes automatically.
+- **`unique: true`** on schema attributes creates DB-level unique indexes automatically. **However**, when Draft & Publish is enabled, Strapi skips unique validation on draft saves — duplicates only fail at publish time. Our custom `checkFullpathUniqueness()` in the before-save hook compensates for this by checking uniqueness on every save.
 - **`ApplicationError`** from `@strapi/utils` is the official way to throw user-facing errors in lifecycle hooks.
+
+### 8.1 Draft & Publish — Lifecycle Hook Interactions
+
+With `draftAndPublish: true` on Page, the Document Service API triggers lifecycle hooks differently depending on the operation. Our hooks must handle this correctly:
+
+| Document Service method | Hooks triggered | Our routing engine behavior |
+|------------------------|----------------|-----------------------------|
+| `create()` | 1x beforeCreate + afterCreate | **Normal**: compute fullpath, set breadcrumb |
+| `create({ status: 'published' })` | 2x beforeCreate/afterCreate + beforeDelete/afterDelete | **Guard skips** the second create (no slug in data) and the delete (internal version cleanup) |
+| `update()` | beforeUpdate + afterUpdate | **Normal**: compute fullpath, detect changes, cascade if needed |
+| `update({ status: 'published' })` | beforeUpdate/afterUpdate + beforeCreate/afterCreate + beforeDelete/afterDelete | **Guard skips** the internal create/delete; only the update runs our logic |
+| `publish()` | beforeCreate/afterCreate + beforeDelete/afterDelete | **Guard skips all**: no slug/parent in data, just version management |
+| `unpublish()` | beforeDelete/afterDelete | **Guard skips**: internal version cleanup, not a real deletion |
+| `discardDraft()` | beforeCreate/afterCreate + beforeDelete/afterDelete | **Guard skips all**: internal version management |
+| `delete()` | beforeDelete/afterDelete | **Normal**: check for children, homepage protection, then allow |
+
+**Guard mechanism summary:**
+- **Before create/update**: skip if `event.params.data` contains no routing-relevant fields (no `slug`, no `parent`). Internal D&P operations carry only internal metadata.
+- **After create/update**: skip if `event.state` has no routing data (the before-hook skipped → nothing to cascade).
+- **Before delete**: skip children/homepage checks if the document still has remaining versions after this delete (meaning it's an internal version replacement, not a real user-initiated deletion).
