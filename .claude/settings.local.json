@@ -3,7 +3,8 @@
     "allow": [
       "mcp__strapi-docs__search_strapi_knowledge_sources",
       "Bash(pnpm install @strapi/plugin-graphql@5.0.0)",
-      "Bash(pnpm run build)"
+      "Bash(pnpm run build)",
+      "Bash(pnpm install @strapi/utils@5.0.0)"
     ]
   },
   "enableAllProjectMcpServers": true,
